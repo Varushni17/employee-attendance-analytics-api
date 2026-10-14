@@ -66,7 +66,7 @@ def from_ms(value):
 
         raise HTTPException(422, "timestamp must be integer epoch milliseconds in the supported range")
 
-    return datetime.fromtimestamp(value / 1000, UTC).replace(microsecond=0)
+    return datetime.fromtimestamp(value // 1000, UTC).replace(microsecond=0)
 
 
 
@@ -176,13 +176,25 @@ def work_hours(pin, pout):
 
 
 
-def overtime_minutes(pout, day, start, end):
 
-    if pout is None: return 0
+def overtime_minutes(pin, pout, day, start, end):
+    # If either punch is missing, there is no overtime.
+    if pin is None or pout is None:
+        return 0
 
-    mins = int((utc(pout) - shift_end(day, start, end)).total_seconds() // 60)
+    # Find the scheduled shift end.
+    scheduled_end = shift_end(day, start, end)
 
+    # A punch-in at or after shift end should not earn overtime.
+    if utc(pin) >= scheduled_end:
+        return 0
+
+    # Calculate whole minutes worked after shift end.
+    mins = int((utc(pout) - scheduled_end).total_seconds() // 60)
+
+    # Count overtime only when it reaches 30 minutes.
     return mins if mins >= 30 else 0
+
 
 
 
@@ -463,7 +475,7 @@ def punch_out(body: PunchOutRequest):
 
     updated = attendance.find_one_and_update({"_id":doc["_id"],"punch_out":None},
 
-        {"$set":{"punch_out":ts,"work_hours":hours,"overtime_minutes":overtime_minutes(ts,doc["date"],emp["shift_start"],emp["shift_end"]),"half_day":half_day(hours)}},
+        {"$set":{"punch_out":ts,"work_hours":hours,"overtime_minutes":overtime_minutes(doc["punch_in"], ts, doc["date"], emp["shift_start"], emp["shift_end"]),"half_day":half_day(hours)}},
 
         return_document=ReturnDocument.AFTER)
 
@@ -561,7 +573,7 @@ def regularize(emp_code: str, day: str, body: RegularizeRequest):
 
     late = late_minutes(pin,day,emp["shift_start"]) if status in PRESENCE else 0
 
-    ot = overtime_minutes(pout,day,emp["shift_start"],emp["shift_end"]) if status in PRESENCE else 0
+    ot = overtime_minutes(pin, pout, day, emp["shift_start"],emp["shift_end"]) if status in PRESENCE else 0
 
     half = half_day(newhours) if status in PRESENCE else False
 
@@ -630,88 +642,262 @@ def employee_monthly(emp_code: str, month: str):
             "attendance_pct":rounded(present/working*100,4) if working else None}
 
 
-
 @app.get("/analytics/departments/summary")
+def department_summary(department: Optional[str] = None):
+    # Include employees who have joined by today, even if they have no logs.
+    current = local(now_utc()).date().isoformat()
 
-def department_summary(department: Optional[str]=None):
+    pipeline = [
+        {
+            "$match": {
+                "joined_on": {"$lte": current},
+                **({"department": department} if department else {})
+            }
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "logs"
+            }
+        },
+        {
+            "$unwind": {
+                "path": "$logs",
+                "preserveNullAndEmptyArrays": True
+            }
+        },
+        {
+            "$addFields": {
+                "is_presence": {
+                    "$in": ["$logs.status", PRESENCE]
+                },
+                "is_weekday": {
+                    "$cond": [
+                        {"$eq": [{"$ifNull": ["$logs.date", None]}, None]},
+                        False,
+                        {
+                            "$in": [
+                                {
+                                    "$dayOfWeek": {
+                                        "$dateFromString": {
+                                            "dateString": "$logs.date"
+                                        }
+                                    }
+                                },
+                                [2, 3, 4, 5, 6]
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "department": "$department",
+                    "emp_code": "$emp_code"
+                },
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": ["$is_presence", "$is_weekday"]},
+                            {
+                                "$cond": [
+                                    {"$eq": [{"$ifNull": ["$logs.half_day", False]}, True]},
+                                    0.5,
+                                    1
+                                ]
+                            },
+                            0
+                        ]
+                    }
+                },
+                "hours_sum": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$is_presence",
+                                    {"$ne": [{"$ifNull": ["$logs.work_hours", None]}, None]}
+                                ]
+                            },
+                            "$logs.work_hours",
+                            0
+                        ]
+                    }
+                },
+                "hours_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$is_presence",
+                                    {"$ne": [{"$ifNull": ["$logs.work_hours", None]}, None]}
+                                ]
+                            },
+                            1,
+                            0
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]},
+                            1,
+                            0
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$logs.late_minutes", 0]}
+                },
+                "leave_count": {
+                    "$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}
+                },
+                "on_duty_count": {
+                    "$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_id.department",
+                "headcount": {"$sum": 1},
+                "present_days": {"$sum": "$present_days"},
+                "hours_sum": {"$sum": "$hours_sum"},
+                "hours_count": {"$sum": "$hours_count"},
+                "late_count": {"$sum": "$late_count"},
+                "total_late_minutes": {"$sum": "$total_late_minutes"},
+                "leave_count": {"$sum": "$leave_count"},
+                "on_duty_count": {"$sum": "$on_duty_count"}
+            }
+        },
+        {"$sort": {"_id": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "department": "$_id",
+                "headcount": 1,
+                "present_days": 1,
+                "hours_sum": 1,
+                "hours_count": 1,
+                "late_count": 1,
+                "total_late_minutes": 1,
+                "leave_count": 1,
+                "on_duty_count": 1
+            }
+        }
+    ]
 
-    emps=list(employees.find({"department":department} if department else {},{"_id":0,"emp_code":1,"department":1,"joined_on":1}))
+    results = []
+    for row in employees.aggregate(pipeline):
+        count = row["hours_count"]
+        results.append({
+            "department": row["department"],
+            "headcount": row["headcount"],
+            "present_days": rounded(row["present_days"]),
+            "avg_work_hours": rounded(row["hours_sum"] / count) if count else None,
+            "late_count": row["late_count"],
+            "total_late_minutes": row["total_late_minutes"],
+            "leave_count": row["leave_count"],
+            "on_duty_count": row["on_duty_count"]
+        })
 
-    if not emps: return []
+    return results
 
-    current=local(now_utc()).date().isoformat()
-
-    eligible=[e for e in emps if e["joined_on"]<=current]
-
-    codes=[e["emp_code"] for e in eligible]
-
-    stats=list(attendance.aggregate([
-
-      {"$match":{"emp_code":{"$in":codes}}},
-
-      {"$group":{"_id":"$emp_code",
-
-        "present_days":{"$sum":{"$cond":[{"$in":["$status",PRESENCE]},{"$cond":[{"$eq":[{"$ifNull":["$half_day",False]},True]},0.5,1]},0]}},
-
-        "hours_sum":{"$sum":{"$cond":[{"$and":[{"$in":["$status",PRESENCE]},{"$ne":["$work_hours",None]}]},"$work_hours",0]}},
-
-        "hours_count":{"$sum":{"$cond":[{"$and":[{"$in":["$status",PRESENCE]},{"$ne":["$work_hours",None]}]},1,0]}},
-
-        "late_count":{"$sum":{"$cond":[{"$gt":[{"$ifNull":["$late_minutes",0]},0]},1,0]}},
-
-        "late_total":{"$sum":{"$ifNull":["$late_minutes",0]}},
-
-        "leave_count":{"$sum":{"$cond":[{"$eq":["$status","LEAVE"]},1,0]}},
-
-        "on_duty_count":{"$sum":{"$cond":[{"$eq":["$status","ON_DUTY"]},1,0]}}}}]))
-
-    sm={x["_id"]:x for x in stats}; result=[]
-
-    for dept in sorted({e["department"] for e in emps}):
-
-        group=[e for e in eligible if e["department"]==dept]; vals=[sm[e["emp_code"]] for e in group if e["emp_code"] in sm]
-
-        hcount=sum(x.get("hours_count",0) for x in vals); hsum=sum(x.get("hours_sum",0) for x in vals)
-
-        result.append({"department":dept,"headcount":len(group),"present_days":rounded(sum(x.get("present_days",0) for x in vals)),
-
-          "avg_work_hours":rounded(hsum/hcount) if hcount else None,"late_count":sum(x.get("late_count",0) for x in vals),
-
-          "total_late_minutes":sum(x.get("late_total",0) for x in vals),"leave_count":sum(x.get("leave_count",0) for x in vals),
-
-          "on_duty_count":sum(x.get("on_duty_count",0) for x in vals)})
-
-    return result
 
 
 
 @app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str,
+    limit: int = Query(10, ge=1, le=100),
+    department: Optional[str] = None
+):
+    start, end = month_range(month)
 
-def late_leaderboard(month: str, limit: int=Query(10,ge=1,le=100), department: Optional[str]=None):
+    # First, select attendance records with late minutes in this month.
+    pipeline = [
+        {
+            "$match": {
+                "date": {
+                    "$gte": start.isoformat(),
+                    "$lte": end.isoformat()
+                },
+                "late_minutes": {"$gt": 0}
+            }
+        },
 
-    start,end=month_range(month)
+        # Calculate total late minutes for each employee.
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"}
+            }
+        },
 
-    rows=list(attendance.aggregate([
+        # Attach employee details and optionally filter by department.
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "employee"
+            }
+        },
+        {"$unwind": "$employee"},
 
-      {"$match":{"date":{"$gte":start.isoformat(),"$lte":end.isoformat()},"late_minutes":{"$gt":0}}},
+        *(
+            [{"$match": {"employee.department": department}}]
+            if department else []
+        ),
 
-      {"$group":{"_id":"$emp_code","total_late_minutes":{"$sum":"$late_minutes"}}},
+        # Sort before assigning competition ranks.
+        {
+            "$sort": {
+                "total_late_minutes": -1,
+                "_id": 1
+            }
+        },
 
-      {"$sort":{"total_late_minutes":-1,"_id":1}}]))
+        # Employees with equal late minutes receive the same rank.
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {
+                    "rank": {"$rank": {}}
+                }
+            }
+        },
 
-    emps={e["emp_code"]:e for e in employees.find({"emp_code":{"$in":[r["_id"] for r in rows]},**({"department":department} if department else {})},{"_id":0,"emp_code":1,"name":1,"department":1})}
+        # Keep the requested top ranks, including ties at the cutoff.
+        {"$match": {"rank": {"$lte": limit}}},
 
-    rows=[r for r in rows if r["_id"] in emps]; out=[]; previous=None; rank=0
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": "$employee.name",
+                "department": "$employee.department",
+                "total_late_minutes": 1
+            }
+        },
 
-    for i,r in enumerate(rows,1):
+        # Stable display order when employees share a rank.
+        {
+            "$sort": {
+                "rank": 1,
+                "emp_code": 1
+            }
+        }
+    ]
 
-        if r["total_late_minutes"]!=previous: rank=i; previous=r["total_late_minutes"]
+    return list(attendance.aggregate(pipeline))
 
-        if rank>limit: break
-
-        e=emps[r["_id"]]; out.append({"rank":rank,"emp_code":r["_id"],"name":e["name"],"department":e["department"],"total_late_minutes":r["total_late_minutes"]})
-
-    return out
 
 
 
